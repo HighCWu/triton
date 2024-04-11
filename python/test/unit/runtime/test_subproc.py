@@ -10,6 +10,8 @@ from triton.compiler import ASTSource
 
 tmpdir = ".tmp"
 
+target = triton.runtime.driver.active.get_current_target()
+
 
 def reset_tmp_dir():
     os.environ["TRITON_CACHE_DIR"] = tmpdir
@@ -30,15 +32,19 @@ def compile_fn(attrs, capability):
         signature={0: "*fp32", 1: "*fp32", 2: "*fp32"},
         attrs=attrs,
     )
-    triton.compile(src=src, target=("cuda", capability))
+    triton.compile(src=src, target=target)
 
 
 def test_compile_in_subproc() -> None:
+    import os
     major, minor = torch.cuda.get_device_capability(0)
     cc = major * 10 + minor
     config = triton.compiler.AttrsDescriptor(tuple(range(4)), ())
 
-    multiprocessing.set_start_method('fork')
+    if os.name == "nt":
+        multiprocessing.set_start_method('spawn')
+    else:
+        multiprocessing.set_start_method('fork')
     proc = multiprocessing.Process(target=compile_fn, args=(config, cc))
     proc.start()
     proc.join()
@@ -55,7 +61,7 @@ def compile_fn_dot(attrs, capability):
         tl.store(Z + offs, z)
 
     src = ASTSource(fn=kernel_dot, signature={0: "*fp32"}, attrs=attrs, constants=dict())
-    triton.compile(src=src, target=("cuda", capability))
+    triton.compile(src=src, target=target)
 
 
 def test_compile_in_forked_subproc() -> None:
@@ -64,7 +70,7 @@ def test_compile_in_forked_subproc() -> None:
     capability = major * 10 + minor
     config = triton.compiler.AttrsDescriptor(tuple(range(1)), ())
 
-    assert multiprocessing.get_start_method() == 'fork'
+    assert multiprocessing.get_start_method() in ['fork', 'spawn']
     proc = multiprocessing.Process(target=compile_fn_dot, args=(config, capability))
     proc.start()
     proc.join()

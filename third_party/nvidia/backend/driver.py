@@ -1,6 +1,7 @@
 import functools
 import os
 import hashlib
+import sysconfig
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,12 +14,20 @@ include_dir = [os.path.join(dirname, "include")]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ['cuda']
 
+if os.name == "nt":
+    include_dir += [os.path.join(os.environ.get("CUDA_PATH"), "include")]
+
 
 @functools.lru_cache()
 def libcuda_dirs():
     env_libcuda_path = os.getenv("TRITON_LIBCUDA_PATH")
     if env_libcuda_path:
         return [env_libcuda_path]
+    if os.name == "nt":
+        installed_base = sysconfig.get_config_var('installed_base')
+        dirs = [os.path.join(os.environ.get("CUDA_PATH"), "lib", "x64")]
+        dirs += [os.getenv("PYTHON_LIB_DIRS", os.path.join(installed_base, "libs"))]
+        return dirs
 
     libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode()
     # each line looks like the following:
@@ -45,9 +54,10 @@ def library_dirs():
 
 
 def compile_module_from_src(src, name):
-    key = hashlib.md5(src.encode("utf-8")).hexdigest()
+    key = hashlib.sha256(src.encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
-    cache_path = cache.get_file(f"{name}.so")
+    so_name = f'{name}.{"so" if os.name != "nt" else "pyd"}'
+    cache_path = cache.get_file(so_name)
     if cache_path is None:
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "main.c")
@@ -55,7 +65,7 @@ def compile_module_from_src(src, name):
                 f.write(src)
             so = _build(name, src_path, tmpdir, library_dirs(), include_dir, libraries)
             with open(so, "rb") as f:
-                cache_path = cache.put(f.read(), f"{name}.so", binary=True)
+                cache_path = cache.put(f.read(), so_name, binary=True)
     import importlib.util
     spec = importlib.util.spec_from_file_location(name, cache_path)
     mod = importlib.util.module_from_spec(spec)
@@ -80,6 +90,7 @@ class CudaUtils(object):
         self.load_binary = mod.load_binary
         self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
+        self.set_printf_fifo_size = mod.set_printf_fifo_size
 
 
 # ------------------------
@@ -96,6 +107,9 @@ def ty_to_cpp(ty):
         "i16": "int16_t",
         "i32": "int32_t",
         "i64": "int64_t",
+        "u1": "uint32_t",
+        "u8": "uint8_t",
+        "u16": "uint16_t",
         "u32": "uint32_t",
         "u64": "uint64_t",
         "fp16": "float",
@@ -106,7 +120,6 @@ def ty_to_cpp(ty):
     }[ty]
 
 
-
 def make_launcher(constants, signature, ids):
     # Record the end of regular arguments;
     # subsequent arguments are architecture-specific descriptors, such as tensor descriptors for CUDA.
@@ -115,18 +128,7 @@ def make_launcher(constants, signature, ids):
     def _extracted_type(ty):
         if ty[0] == '*':
             return "PyObject*"
-        return {
-            'i1': 'int32_t',
-            'i32': 'int32_t',
-            'i64': 'int64_t',
-            'u32': 'uint32_t',
-            'u64': 'uint64_t',
-            'fp16': 'float',
-            'bf16': 'float',
-            'fp32': 'float',
-            'f32': 'float',
-            'fp64': 'double',
-        }[ty]
+        return ty_to_cpp(ty)
 
     def format_of(ty):
         return {
@@ -134,24 +136,32 @@ def make_launcher(constants, signature, ids):
             "float": "f",
             "double": "d",
             "long": "l",
-            "uint32_t": "I",
+            "int8_t": "b",
+            "int16_t": "h",
             "int32_t": "i",
+            "int64_t": "l",
+            "uint8_t": "B",
+            "uint16_t": "H",
+            "uint32_t": "I",
             "uint64_t": "K",
-            "int64_t": "L",
         }[ty]
 
-    format = "iiiiiiiiiKKOOO" + ''.join([format_of(_extracted_type(ty)) for ty in signature.values()])
+    args_format = ''.join([format_of(_extracted_type(ty)) for ty in signature.values()])
+    format = "iiiKKOOOO" + args_format
+    args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
 
     # generate glue code
-    params = [
-        i for i in signature.keys()
-        if i not in constants
-    ]
+    params = [i for i in signature.keys() if i not in constants]
     src = f"""
 #include \"cuda.h\"
 #include <stdbool.h>
 #include <Python.h>
+#ifndef _WIN32
 #include <dlfcn.h>
+#else
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 static inline void gpuAssert(CUresult code, const char *file, int line)
 {{
@@ -174,6 +184,7 @@ static inline void gpuAssert(CUresult code, const char *file, int line)
 
 typedef CUresult (*cuLaunchKernelEx_t)(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
 
+#ifndef _WIN32
 static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   // Open the shared library
   void* handle = dlopen("libcuda.so", RTLD_LAZY);
@@ -192,6 +203,25 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   }}
   return cuLaunchKernelExHandle;
 }}
+#else
+static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
+  // Open the shared library
+  HMODULE handle = LoadLibraryA("nvcuda.dll");
+  if (!handle) {{
+    PyErr_SetString(PyExc_RuntimeError, "Failed to open nvcuda.dll");
+    return NULL;
+  }}
+  cuLaunchKernelEx_t cuLaunchKernelExHandle =
+      (cuLaunchKernelEx_t)GetProcAddress((HMODULE)handle, "cuLaunchKernelEx");
+  // Check for errors
+  long error = GetLastError();
+  if (error) {{
+    PyErr_SetString(PyExc_RuntimeError, "Failed to retrieve cuLaunchKernelEx from nvcuda.dll");
+    return NULL;
+  }}
+  return cuLaunchKernelExHandle;
+}}
+#endif
 
 static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
   void *params[] = {{ {', '.join(f"&arg{i}" for i in params)} }};
@@ -277,24 +307,40 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   int gridX, gridY, gridZ;
   uint64_t _stream;
   uint64_t _function;
-  int num_warps;
-  int num_ctas;
-  int clusterDimX;
-  int clusterDimY;
-  int clusterDimZ;
-  int shared_memory;
   PyObject *launch_enter_hook = NULL;
   PyObject *launch_exit_hook = NULL;
-  PyObject *compiled_kernel = NULL;
+  PyObject *kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
   {' '.join([f"{_extracted_type(ty)} _arg{i}; " for i, ty in signature.items()])}
-  if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &num_warps, &num_ctas, &clusterDimX, &clusterDimY, &clusterDimZ, &shared_memory, &_stream, &_function, &launch_enter_hook, &launch_exit_hook, &compiled_kernel{', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''})) {{
+  if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &_stream, &_function,
+                                           &kernel_metadata, &launch_metadata,
+                                           &launch_enter_hook, &launch_exit_hook {args_list})) {{
     return NULL;
   }}
 
-  if (launch_enter_hook != Py_None && !PyObject_CallObject(launch_enter_hook, args)) {{
+  // extract kernel metadata
+  int num_warps     = PyLong_AsLong(PyObject_GetAttrString(kernel_metadata, "num_warps"));
+  int num_ctas      = PyLong_AsLong(PyObject_GetAttrString(kernel_metadata, "num_ctas"));
+  int shared_memory = PyLong_AsLong(PyObject_GetAttrString(kernel_metadata, "shared"));
+
+  // extract cluster dims
+  PyObject *clusterDim =  PyObject_GetAttrString(kernel_metadata, "cluster_dims");
+  if (!PyTuple_Check(kernel_metadata)) {{
+    PyErr_SetString(PyExc_TypeError, "kernel_metadata.cluster_dims must be a tuple");
     return NULL;
   }}
+  int clusterDimX   = PyLong_AsLong(PyTuple_GetItem(clusterDim, 0));
+  int clusterDimY   = PyLong_AsLong(PyTuple_GetItem(clusterDim, 1));
+  int clusterDimZ   = PyLong_AsLong(PyTuple_GetItem(clusterDim, 2));
 
+  // extract launch metadata
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+  }}
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
@@ -305,8 +351,13 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     return NULL;
   }}
 
-  if (launch_exit_hook != Py_None && !PyObject_CallObject(launch_exit_hook, args)) {{
-    return NULL;
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
+
   }}
 
   // return None
@@ -342,11 +393,12 @@ PyMODINIT_FUNC PyInit___triton_launcher(void) {{
 class CudaLauncher(object):
 
     def __init__(self, src, metadata):
-        ids = {
-            "ids_of_const_exprs": src.fn.constexprs if hasattr(src, "fn") else tuple()
-        }
+        ids = {"ids_of_const_exprs": src.fn.constexprs if hasattr(src, "fn") else tuple()}
         constants = src.constants if hasattr(src, "constants") else dict()
-        src = make_launcher(constants, src.signature, ids)
+        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
+        constants = {cst_key(key): value for key, value in constants.items()}
+        signature = {cst_key(key): value for key, value in src.signature.items()}
+        src = make_launcher(constants, signature, ids)
         mod = compile_module_from_src(src, "__triton_launcher")
         self.launch = mod.launch
 
@@ -358,7 +410,6 @@ class CudaDriver(GPUDriver):
 
     def __init__(self):
         self.utils = CudaUtils()  # TODO: make static
-        self.binary_ext = "cubin"
         self.launcher_cls = CudaLauncher
         super().__init__()
 
@@ -366,7 +417,8 @@ class CudaDriver(GPUDriver):
         device = self.get_current_device()
         capability = self.get_device_capability(device)
         capability = capability[0] * 10 + capability[1]
-        return ("cuda", capability)
+        warp_size = 32
+        return ("cuda", capability, warp_size)
 
     @staticmethod
     def is_active():

@@ -30,8 +30,17 @@ set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 # used conditionally in this file and by lit tests
 
 # Customized release build type with assertions: TritonRelBuildWithAsserts
-set(CMAKE_C_FLAGS_TRITONRELBUILDWITHASSERTS "-O2 -g")
-set(CMAKE_CXX_FLAGS_TRITONRELBUILDWITHASSERTS "-O2 -g")
+if(NOT MSVC)
+  set(CMAKE_C_FLAGS_TRITONRELBUILDWITHASSERTS "-O2 -g")
+  set(CMAKE_CXX_FLAGS_TRITONRELBUILDWITHASSERTS "-O2 -g")
+else()
+  set(CMAKE_C_FLAGS_TRITONRELBUILDWITHASSERTS "/Zi /Ob0 /Od /RTC1")
+  set(CMAKE_CXX_FLAGS_TRITONRELBUILDWITHASSERTS "/Zi /Ob0 /Od /RTC1")
+  set(CMAKE_EXE_LINKER_FLAGS_TRITONRELBUILDWITHASSERTS "/debug:fastlink /INCREMENTAL")
+  set(CMAKE_MODULE_LINKER_FLAGS_TRITONRELBUILDWITHASSERTS "/debug:fastlink /INCREMENTAL")
+  set(CMAKE_SHARED_LINKER_FLAGS_TRITONRELBUILDWITHASSERTS "/debug:fastlink /INCREMENTAL")
+  set(CMAKE_STATIC_LINKER_FLAGS_TRITONRELBUILDWITHASSERTS "/debug:fastlink /INCREMENTAL")
+endif()
 
 # Default build type
 if(NOT CMAKE_BUILD_TYPE)
@@ -45,11 +54,15 @@ endif()
 
 # Compiler flags
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC -std=gnu++17")
-
-# Third-party
-include_directories(${PYBIND11_INCLUDE_DIR})
-
+if(NOT MSVC)
+  if(NOT WIN32)
+    set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC -std=gnu++17")
+  else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -D__STDC_FORMAT_MACROS -std=gnu++17 -Wno-deprecated")
+  endif()
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -D__STDC_FORMAT_MACROS  /wd4244 /wd4624 /wd4715 /wd4530")
+endif()
 
 
 # #########
@@ -103,13 +116,19 @@ endfunction()
 
 
 # Disable warnings that show up in external code (gtest;pybind11)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-covered-switch-default -fvisibility=hidden")
+if(NOT MSVC)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-covered-switch-default -fvisibility=hidden")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /WX-")
+endif()
 
 include_directories(".")
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include) # Tablegen'd files
+include_directories(${PROJECT_SOURCE_DIR}/third_party)
+include_directories(${PROJECT_BINARY_DIR}/third_party) # Tablegen'd files
 
 # link_directories(${LLVM_LIBRARY_DIR})
 add_subdirectory(include)
@@ -136,13 +155,39 @@ if(TRITON_BUILD_PYTHON_MODULE)
   include_directories(${PYTHON_SRC_PATH})
 
   if(PYTHON_INCLUDE_DIRS)
+    # We have PYTHON_INCLUDE_DIRS set--this is what we expect when building
+    # using pip install.
     include_directories(${PYTHON_INCLUDE_DIRS})
+    include_directories(${PYBIND11_INCLUDE_DIR})
+    message(STATUS "PYTHON_LIB_DIRS ${PYTHON_LIB_DIRS}")
+    link_directories(${PYTHON_LIB_DIRS})
   else()
+    # Otherwise, we might be building from top CMakeLists.txt directly.
+    # Try to find Python and pybind11 packages.
     find_package(Python3 REQUIRED COMPONENTS Development Interpreter)
+    find_package(pybind11 CONFIG REQUIRED HINTS "${Python3_SITELIB}")
     include_directories(${Python3_INCLUDE_DIRS})
+    include_directories(${pybind11_INCLUDE_DIR})
     link_directories(${Python3_LIBRARY_DIRS})
     link_libraries(${Python3_LIBRARIES})
     add_link_options(${Python3_LINK_OPTIONS})
+  endif()
+
+  if (DEFINED TRITON_PLUGIN_DIRS)
+    foreach(PLUGIN_DIR ${TRITON_PLUGIN_DIRS})
+      # Read the plugin name under dir/backend/name.conf
+      cmake_path(APPEND PLUGIN_DIR "backend" "name.conf" OUTPUT_VARIABLE PLUGIN_NAME_PATH)
+      file(READ ${PLUGIN_NAME_PATH} PLUGIN_NAME)
+      string(STRIP ${PLUGIN_NAME} PLUGIN_NAME)
+
+      list(APPEND TRITON_PLUGIN_NAMES ${PLUGIN_NAME})
+
+      # Include the plugin as part of the build, placing the build output under
+      # ${TRITON_BINARY_DIR}/third_party/${PLUGIN_NAME}
+      cmake_path(APPEND TRITON_BINARY_DIR "third_party" ${PLUGIN_NAME} OUTPUT_VARIABLE PLUGIN_DIR_BUILD_OUTPUT)
+      message(STATUS "Building plugin '${PLUGIN_NAME}' from ${PLUGIN_DIR} with output ${PLUGIN_DIR_BUILD_OUTPUT}")
+      add_subdirectory(${PLUGIN_DIR} ${PLUGIN_DIR_BUILD_OUTPUT})
+    endforeach()
   endif()
 
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
@@ -180,17 +225,34 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
     # LLVM
     LLVMPasses
-    LLVMX86CodeGen
-    LLVMX86AsmParser
     LLVMNVPTXCodeGen
     # LLVMNVPTXAsmPrinter
     LLVMAMDGPUCodeGen
     LLVMAMDGPUAsmParser
 
   )
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
+     CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")     # macOS arm64
+      list(APPEND TRITON_LIBRARIES
+          LLVMAArch64CodeGen
+          LLVMAArch64AsmParser
+      )
+  else()
+      list(APPEND TRITON_LIBRARIES
+          LLVMX86CodeGen
+          LLVMX86AsmParser
+      )
+  endif()
 
   # Define triton library
   string(JOIN "," TRITON_BACKENDS_TUPLE ${TRITON_CODEGEN_BACKENDS})
+
+  if (DEFINED TRITON_PLUGIN_NAMES)
+    string(JOIN "," TRITON_BACKENDS_TUPLE ${TRITON_BACKENDS_TUPLE} ${TRITON_PLUGIN_NAMES})
+  endif()
+
+  message(STATUS "Triton backends tuple: ${TRITON_BACKENDS_TUPLE}")
+
   set(TRITON_BACKENDS_TUPLE "(${TRITON_BACKENDS_TUPLE})")
   add_compile_definitions(TRITON_BACKENDS_TUPLE=${TRITON_BACKENDS_TUPLE})
   add_library(triton SHARED ${PYTHON_SRC_PATH}/main.cc
@@ -203,6 +265,8 @@ if(TRITON_BUILD_PYTHON_MODULE)
   target_link_libraries(triton PUBLIC ${TRITON_LIBRARIES})
   if(WIN32)
     target_link_libraries(triton PRIVATE ${CMAKE_DL_LIBS})
+    set_target_properties(triton PROPERTIES SUFFIX ".pyd")
+    set_target_properties(triton PROPERTIES PREFIX "lib")
   else()
     target_link_libraries(triton PRIVATE z)
   endif()
@@ -220,6 +284,19 @@ if(TRITON_BUILD_PYTHON_MODULE AND NOT WIN32)
   target_link_libraries(triton PRIVATE ${PYTHON_LDFLAGS})
 endif()
 
+if(NOT TRITON_BUILD_PYTHON_MODULE)
+  foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
+    add_subdirectory(third_party/${CODEGEN_BACKEND})
+  endforeach()
+endif()
+
+if(WIN32)
+  option(CMAKE_USE_WIN32_THREADS_INIT "using WIN32 threads" ON)
+  option(gtest_disable_pthreads "Disable uses of pthreads in gtest." ON)
+endif()
+
 add_subdirectory(bin)
 add_subdirectory(test)
-add_subdirectory(unittest)
+if(NOT WIN32) # not to build test for windows
+  add_subdirectory(unittest)
+endif()

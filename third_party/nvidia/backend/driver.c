@@ -1,8 +1,14 @@
 #include "cuda.h"
+#ifndef _WIN32
 #include <dlfcn.h>
+#else
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #include <stdbool.h>
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <stdatomic.h>
 
 // Raises a Python exception and returns false if code is not CUDA_SUCCESS.
 static bool gpuAssert(CUresult code, const char *file, int line) {
@@ -135,6 +141,7 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
 typedef CUresult (*cuOccupancyMaxActiveClusters_t)(
     int *numClusters, CUfunction func, const CUlaunchConfig *config);
 
+#ifndef _WIN32
 #define defineGetFunctionHandle(name, symbolName)                              \
   static symbolName##_t name() {                                               \
     /* Open the shared library */                                              \
@@ -156,6 +163,27 @@ typedef CUresult (*cuOccupancyMaxActiveClusters_t)(
     }                                                                          \
     return funcHandle;                                                         \
   }
+#else
+#define defineGetFunctionHandle(name, symbolName)                              \
+  static symbolName##_t name() {                                               \
+    /* Open the shared library */                                              \
+    HMODULE handle = LoadLibraryA("nvcuda.dll");                               \
+    if (!handle) {                                                             \
+      PyErr_SetString(PyExc_RuntimeError, "Failed to open nvcuda.dll");        \
+      return NULL;                                                             \
+    }                                                                          \
+    symbolName##_t funcHandle =                                                \
+        (symbolName##_t)GetProcAddress((HMODULE)handle, #symbolName);          \
+    /* Check for errors */                                                     \
+    long err = GetLastError();                                                 \
+    if (err) {                                                                 \
+      PyErr_SetString(PyExc_RuntimeError,                                      \
+                      "Failed to retrieve " #symbolName " from nvcuda.dll");   \
+      return NULL;                                                             \
+    }                                                                          \
+    return funcHandle;                                                         \
+  }
+#endif
 
 defineGetFunctionHandle(getCuOccupancyMaxActiveClustersHandle,
                         cuOccupancyMaxActiveClusters);
@@ -209,6 +237,45 @@ static PyObject *occupancyMaxActiveClusters(PyObject *self, PyObject *args) {
   return PyLong_FromLong(maxActiveClusters);
 }
 
+static PyObject *setPrintfFifoSize(PyObject *self, PyObject *args) {
+  long size;
+  if (!PyArg_ParseTuple(args, "l", &size)) {
+    return NULL;
+  }
+  if (size < 0) {
+    PyErr_SetString(PyExc_ValueError, "fifo size must be non-negative");
+    return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS;
+
+  // Ensure we have an active context.
+  CUcontext ctx = NULL;
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuCtxGetCurrent(&ctx));
+  if (!ctx) {
+    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
+        cuDevicePrimaryCtxRetain(&ctx, /*device=*/0));
+    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuCtxSetCurrent(ctx));
+  }
+
+  // We can't set the fifo size after running a kernel that calls printf.  This
+  // is true even if the set() call is a nop and the new size is the same as the
+  // old size.
+  //
+  // This is unfriendly, so check if the old size matches the new size, and skip
+  // the set() call if so.
+  size_t oldSize = 0;
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
+      cuCtxGetLimit(&oldSize, CU_LIMIT_PRINTF_FIFO_SIZE));
+  if (oldSize != size) {
+    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
+        cuCtxSetLimit(CU_LIMIT_PRINTF_FIFO_SIZE, size));
+  }
+
+  Py_END_ALLOW_THREADS;
+  return Py_None;
+}
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
@@ -216,6 +283,12 @@ static PyMethodDef ModuleMethods[] = {
      "Get the properties for a given device"},
     {"cuOccupancyMaxActiveClusters", occupancyMaxActiveClusters, METH_VARARGS,
      "Python interface for cuOccupancyMaxActiveClusters function"},
+    {"set_printf_fifo_size", setPrintfFifoSize, METH_VARARGS,
+     "Python interface for cuCtxSetLimit(CU_LIMIT_PRINTF_FIFO_SIZE, x), which "
+     "controls how many bytes can be streamed from kernels before data starts "
+     "being dropped.  This inherits all the limitations of this call; in "
+     "particular it's an error to change this value after launching any kernel "
+     "that calls printf()."},
     {NULL, NULL, 0, NULL} // sentinel
 };
 
